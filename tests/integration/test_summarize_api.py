@@ -99,3 +99,42 @@ async def test_staged_lists_and_reads_one(client, monkeypatch):
     assert one["staged"][0]["diff"] == "@@ ... @@"
     miss = (await client.get("/api/v1/summarize/staged", params={"path": "./nope.md"})).json()
     assert miss["staged"] == []
+
+
+async def test_apply_defaults_dry_run_and_passes_go_through(client, monkeypatch):
+    seen: dict = {}
+
+    def fake_apply(config, path=None, *, go=False):
+        seen["path"], seen["go"] = path, go
+        return {"applied": [path] if (go and path) else [], "skipped": [], "dry_run": not go}
+
+    monkeypatch.setattr("tokenjam.core.summarize.apply.apply_staged", fake_apply)
+    dry = (await client.post("/api/v1/summarize/apply", json={"path": "./CLAUDE.md"})).json()
+    assert seen == {"path": "./CLAUDE.md", "go": False} and dry["dry_run"] is True
+    wrote = (await client.post("/api/v1/summarize/apply", json={"path": "./CLAUDE.md", "go": True})).json()
+    assert seen["go"] is True and wrote["applied"] == ["./CLAUDE.md"]
+
+
+async def test_apply_all_when_path_omitted(client, monkeypatch):
+    captured: dict = {}
+    monkeypatch.setattr(
+        "tokenjam.core.summarize.apply.apply_staged",
+        lambda config, path=None, *, go=False: captured.update(path=path) or {"applied": [], "skipped": [], "dry_run": not go},
+    )
+    await client.post("/api/v1/summarize/apply", json={})
+    assert captured["path"] is None   # omitted → apply all staged
+
+
+async def test_undo_ok_and_drift_returns_409(client, monkeypatch):
+    from tokenjam.core.summarize.session import SummarizeRefused
+
+    def fake_undo(config, path, *, go=False):
+        if path == "./drifted.md":
+            raise SummarizeRefused("file changed since backup")
+        return {"path": path, "restored": go, "dry_run": not go}
+
+    monkeypatch.setattr("tokenjam.core.summarize.apply.undo", fake_undo)
+    ok = await client.post("/api/v1/summarize/undo", json={"path": "./CLAUDE.md", "go": True})
+    assert ok.status_code == 200 and ok.json()["restored"] is True
+    bad = await client.post("/api/v1/summarize/undo", json={"path": "./drifted.md", "go": True})
+    assert bad.status_code == 409

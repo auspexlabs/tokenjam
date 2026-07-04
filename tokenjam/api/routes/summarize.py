@@ -19,6 +19,7 @@ import shutil
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel
 
 from tokenjam.api.deps import require_api_key
 
@@ -84,3 +85,44 @@ def get_summarize_staged(
         rec = session.read_staged(config, path)
         return {"staged": [rec] if rec is not None else []}
     return {"staged": session.list_staged(config)}
+
+
+# --------------------------------------------------------------------------- #
+# Mutating routes — the deliberate departure: Lens's first file-writing action.
+# Both call core directly (never re-implement the guards) so every write keeps
+# the shipped guarantees: owner-check + content-hash drift-refuse + symlink-refuse
+# + gzip backup. Default is DRY-RUN (go=false); the UI sends go=true only on an
+# explicit per-file Apply — no flag bypasses a guard.
+# --------------------------------------------------------------------------- #
+class ApplyRequest(BaseModel):
+    path: str | None = None   # one staged file, or all staged when omitted
+    go: bool = False          # false = dry-run (returns the plan, writes nothing)
+
+
+class UndoRequest(BaseModel):
+    path: str
+    go: bool = False
+
+
+@router.post("/summarize/apply", dependencies=[Depends(require_api_key)])
+def post_summarize_apply(request: Request, body: ApplyRequest) -> dict[str, Any]:
+    """Apply staged rewrite(s) to disk via core `apply_staged` (per-file guards inside).
+
+    Dry-run by default: returns `{applied, skipped, dry_run}`; drifted/unowned/symlink
+    files are skipped-with-reason, never forced.
+    """
+    from tokenjam.core.summarize.apply import apply_staged
+
+    return apply_staged(_config(request), body.path, go=body.go)
+
+
+@router.post("/summarize/undo", dependencies=[Depends(require_api_key)])
+def post_summarize_undo(request: Request, body: UndoRequest) -> dict[str, Any]:
+    """Restore a file from its backup via core `undo`; refuses (409) on drift/missing."""
+    from tokenjam.core.summarize.apply import undo
+    from tokenjam.core.summarize.session import SummarizeRefused
+
+    try:
+        return undo(_config(request), body.path, go=body.go)
+    except SummarizeRefused as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
